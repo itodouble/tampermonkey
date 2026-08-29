@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MoeUB 服务器自动进服助手
 // @namespace    http://tampermonkey.net/
-// @version      2.3
+// @version      0.1
 // @description  在MoeUB服务器详情弹窗中添加自动进服功能，人数少于阈值时自动连接
 // @author       You
 // @match        https://cs.moeub.cn/play*
