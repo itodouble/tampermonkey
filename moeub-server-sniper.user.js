@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         MoeUB 服务器抢人助手
+// @name         MoeUB 服务器自动进服助手
 // @namespace    http://tampermonkey.net/
 // @version      2.3
-// @description  在MoeUB服务器详情弹窗中添加抢人功能，人数少于阈值时自动连接
+// @description  在MoeUB服务器详情弹窗中添加自动进服功能，人数少于阈值时自动连接
 // @author       You
 // @match        https://cs.moeub.cn/play*
 // @match        https://cs.moeub.cn/user*
@@ -25,7 +25,7 @@
     let monitoring = false;
     let monitorTimer = null;
     let threshold = CONFIG.defaultThreshold;
-    const LOG_PREFIX = '[MoeUB抢人]';
+    const LOG_PREFIX = '[MoeUB自动进服]';
 
     function log(...args) { console.log(LOG_PREFIX, ...args); }
 
@@ -114,7 +114,7 @@
         monitoring = false;
         hideFloatingStatus();
         document.querySelectorAll('.mo-sniper-btn').forEach(btn => {
-            btn.textContent = '🎯 抢人';
+            btn.textContent = '🎯 自动进服';
             btn.style.background = '';
             btn.dataset.moActive = 'false';
         });
@@ -277,7 +277,7 @@
 
             const btn = createSniperButton(serverId, addr.host, addr.port, currentPlayers, maxSlots, popup);
             joinBtn.parentNode.insertBefore(btn, joinBtn);
-            log(`已为 #${serverId} 注入抢人按钮`);
+            log(`已为 #${serverId} 注入自动进服按钮`);
             break;
         }
     }
@@ -285,7 +285,7 @@
     function createSniperButton(serverId, host, port, currentPlayers, maxSlots, popup) {
         const btn = document.createElement('button');
         btn.className = 'mo-sniper-btn';
-        btn.textContent = '🎯 抢人';
+        btn.textContent = '🎯 自动进服';
         btn.title = `监控 #${serverId}，当前 ${currentPlayers}/${maxSlots}`;
         btn._moPopup = popup;
         btn.dataset.moActive = 'false';
@@ -346,7 +346,7 @@
 
             const btn = document.createElement('button');
             btn.className = 'mo-sniper-btn';
-            btn.textContent = '🎯 抢人';
+            btn.textContent = '🎯 自动进服';
             btn.dataset.moActive = 'false';
             btn.style.cssText = `
                 display:inline-flex; align-items:center; background:linear-gradient(135deg, #667eea, #764ba2);
@@ -432,7 +432,7 @@
         `;
         panel.innerHTML = `
             <div style="display:flex;align-items:center;gap:6px;margin-bottom:10px;font-weight:bold;">
-                <span>🎯</span><span>抢人设置</span>
+                <span>🎯</span><span>自动进服设置</span>
                 <button id="mo-set-toggle" style="margin-left:auto;background:rgba(255,255,255,0.1);border:none;color:white;width:22px;height:22px;border-radius:50%;cursor:pointer;font-size:11px;">-</button>
             </div>
             <div id="mo-set-body">
