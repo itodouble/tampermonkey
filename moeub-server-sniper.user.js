@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MoeUB 服务器自动进服助手
 // @namespace    http://tampermonkey.net/
-// @version      0.1
+// @version      0.2
 // @description  在MoeUB服务器详情弹窗中添加自动进服功能，人数少于阈值时自动连接
 // @author       You
 // @match        https://cs.moeub.cn/play*
@@ -16,6 +16,7 @@
     'use strict';
 
     const STORAGE_KEY = 'mo_sniper_username';
+    const SCRIPT_VERSION = typeof GM_info !== 'undefined' ? GM_info.script.version : 'unknown';
     const CONFIG = {
         checkInterval: 2000,
         defaultThreshold: 64,
@@ -168,11 +169,13 @@
             }
 
             const text = popup.textContent || '';
-            const pi = parsePlayerInfo(text);
+            const pi = findPlayerCountInPopup(popup) || parsePlayerInfo(text);
             if (pi) {
                 log(`当前人数: ${pi.current}/${pi.max}, 阈值: ${threshold}`);
                 updateFloatingStatus(`#${serverLabel}: ${pi.current}/${pi.max} 人`);
-                if (pi.current < threshold) {
+                if (pi.current >= pi.max) {
+                    log('服务器已满，跳过连接');
+                } else if (pi.current < threshold) {
                     log('人数满足条件，准备连接...');
                     connectToServer(host, port);
                     stopMonitoring();
@@ -180,7 +183,13 @@
                     log('人数未满足条件');
                 }
             } else {
-                log('未匹配到人数, text snippet:', text.substring(0, 150));
+                const candidates = [];
+                popup.querySelectorAll('*').forEach(el => {
+                    if (el.children.length <= 2 && el.textContent.trim().length <= 30) {
+                        candidates.push(el.tagName + '.' + el.className + ': ' + el.textContent.trim());
+                    }
+                });
+                log('未匹配到人数, 候选元素:', candidates.slice(0, 20));
             }
         };
 
@@ -200,8 +209,57 @@
         if (!text || typeof text !== 'string') return null;
         if (text.includes('暂无玩家')) return { current: 0, max: 64 };
         const cleaned = text.replace(/\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}:\d+/g, '');
-        const m = cleaned.match(/(\d+)\s*[/:]\s*(\d+)/);
-        return m ? { current: parseInt(m[1], 10), max: parseInt(m[2], 10) } : null;
+
+        // 优先从"玩家"关键词附近匹配
+        const playerLabelMatch = cleaned.match(/玩家\D{0,5}(\d+)\s*[/:]\s*(\d+)/);
+        if (playerLabelMatch) {
+            const cur = parseInt(playerLabelMatch[1], 10);
+            const max = parseInt(playerLabelMatch[2], 10);
+            if (max > 0 && cur <= max) {
+                log('通过"玩家"标签匹配到人数:', cur, '/', max);
+                return { current: cur, max: max };
+            }
+        }
+
+        // 回退：匹配所有 number/number 模式，选择 max 值最大的（通常是服务器容量）
+        const allMatches = [...cleaned.matchAll(/(\d+)\s*[/:]\s*(\d+)/g)];
+        if (allMatches.length === 0) return null;
+
+        // 按 max 降序排列，取 max 最大的那个（通常是服务器总槽位数）
+        let best = null;
+        for (const m of allMatches) {
+            const cur = parseInt(m[1], 10);
+            const max = parseInt(m[2], 10);
+            if (max > 0 && cur <= max) {
+                if (!best || max > best.max || (max === best.max && cur > best.current)) {
+                    best = { current: cur, max: max };
+                }
+            }
+        }
+        if (best) {
+            log('回退匹配到人数:', best.current, '/', best.max, '(共', allMatches.length, '个候选)');
+        }
+        return best;
+    }
+
+    function findPlayerCountInPopup(popup) {
+        if (!popup) return null;
+        const allEls = popup.querySelectorAll('*');
+        for (const el of allEls) {
+            if (el.children.length > 2) continue;
+            const t = el.textContent.trim();
+            if (t.length > 30) continue;
+            const m = t.match(/^(\d{1,3})\s*\/\s*(\d{1,3})$/);
+            if (m) {
+                const cur = parseInt(m[1], 10);
+                const max = parseInt(m[2], 10);
+                if (max > 0 && cur <= max && max <= 128) {
+                    log('从DOM元素找到人数:', cur, '/', max, '元素:', el.tagName, el.className);
+                    return { current: cur, max: max };
+                }
+            }
+        }
+        return null;
     }
 
     function getPopupForElement(el) {
@@ -266,7 +324,7 @@
                 continue;
             }
 
-            const playerInfo = parsePlayerInfo(popupText);
+            const playerInfo = findPlayerCountInPopup(popup) || parsePlayerInfo(popupText);
             const maxSlots = playerInfo ? playerInfo.max : 64;
             const currentPlayers = playerInfo ? playerInfo.current : 0;
 
@@ -309,7 +367,7 @@
             }
             const freshText = popup.textContent || '';
             const freshAddr = parseIPPort(freshText) || { host, port };
-            const freshPI = parsePlayerInfo(freshText);
+            const freshPI = findPlayerCountInPopup(popup) || parsePlayerInfo(freshText);
             const freshCurrent = freshPI ? freshPI.current : currentPlayers;
             const freshMax = freshPI ? freshPI.max : maxSlots;
             startMonitoring(freshAddr.host, freshAddr.port, `${serverId} ${freshCurrent}/${freshMax}`, btn);
@@ -433,9 +491,9 @@
         panel.innerHTML = `
             <div style="display:flex;align-items:center;gap:6px;margin-bottom:10px;font-weight:bold;">
                 <span>🎯</span><span>自动进服设置</span>
-                <button id="mo-set-toggle" style="margin-left:auto;background:rgba(255,255,255,0.1);border:none;color:white;width:22px;height:22px;border-radius:50%;cursor:pointer;font-size:11px;">-</button>
+                <button id="mo-set-toggle" style="margin-left:auto;background:rgba(255,255,255,0.1);border:none;color:white;width:22px;height:22px;border-radius:50%;cursor:pointer;font-size:11px;">+</button>
             </div>
-            <div id="mo-set-body">
+            <div id="mo-set-body" style="display:none;">
                 <div style="margin-bottom:8px;">
                     <label style="display:block;margin-bottom:2px;">Steam 昵称：</label>
                     <div style="display:flex;align-items:center;gap:6px;">
@@ -517,7 +575,7 @@
 
     function init() {
         currentPath = window.location.pathname;
-        log('v2.3 已加载, 昵称:', getUsername() || '(未设置)');
+        log(`v${SCRIPT_VERSION} 已加载, 昵称:`, getUsername() || '(未设置)');
         runForCurrentPage();
 
         // 监听 SPA 导航（pushState / replaceState）
