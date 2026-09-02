@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MoeUB 服务器自动进服助手
 // @namespace    http://tampermonkey.net/
-// @version      0.2
+// @version      0.3
 // @description  在MoeUB服务器详情弹窗中添加自动进服功能，人数少于阈值时自动连接
 // @author       You
 // @match        https://cs.moeub.cn/play*
@@ -244,21 +244,40 @@
 
     function findPlayerCountInPopup(popup) {
         if (!popup) return null;
+
+        // 统计玩家列表中的玩家元素数量
+        const playerListContainer = popup.querySelector('.flex.flex-1.flex-col.gap-3, .overflow-y-auto');
+        if (playerListContainer) {
+            const playerEntries = playerListContainer.querySelectorAll('.relative.max-w-fit');
+            if (playerEntries.length > 0) {
+                log('通过DOM计算玩家数:', playerEntries.length);
+                return { current: playerEntries.length, max: 64 };
+            }
+        }
+
+        // 回退：查找文本为纯 "X/Y" 的元素
         const allEls = popup.querySelectorAll('*');
         for (const el of allEls) {
-            if (el.children.length > 2) continue;
             const t = el.textContent.trim();
-            if (t.length > 30) continue;
-            const m = t.match(/^(\d{1,3})\s*\/\s*(\d{1,3})$/);
+            if (t.length > 40 || t.length < 3) continue;
+            const m = t.match(/^(\d{1,3})\s*\/\s*(\d{1,3})\s*$/);
             if (m) {
                 const cur = parseInt(m[1], 10);
                 const max = parseInt(m[2], 10);
                 if (max > 0 && cur <= max && max <= 128) {
-                    log('从DOM元素找到人数:', cur, '/', max, '元素:', el.tagName, el.className);
+                    log('从DOM文本找到人数:', cur, '/', max);
                     return { current: cur, max: max };
                 }
             }
         }
+
+        // 最后回退：检测"暂无玩家"
+        const text = popup.textContent || '';
+        if (text.includes('暂无玩家')) {
+            log('检测到"暂无玩家"');
+            return { current: 0, max: 64 };
+        }
+
         return null;
     }
 
