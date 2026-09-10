@@ -1,12 +1,11 @@
 // ==UserScript==
-// @name         MoeUB 服务器自动进服助手
+// @name         MoeUB 助手
 // @namespace    http://tampermonkey.net/
 // @version      0.3
-// @description  在MoeUB服务器详情弹窗中添加自动进服功能，人数少于阈值时自动连接
+// @description  在MoeUB服务器详情弹窗中添加自动进服功能，人数少于阈值时自动连接、换图提醒
 // @author       You
 // @match        https://cs.moeub.cn/play*
 // @match        https://cs.moeub.cn/user*
-// @match        https://csgo.moeub.cn/server*
 // @icon         https://cs.moeub.cn/favicon.svg
 // @grant        none
 // @run-at       document-idle
@@ -26,17 +25,23 @@
     let monitoring = false;
     let monitorTimer = null;
     let threshold = CONFIG.defaultThreshold;
-    const LOG_PREFIX = '[MoeUB自动进服]';
+
+    let mapMonitoring = false;
+    let mapMonitorTimer = null;
+    let lastMapName = '';
+    const LOG_PREFIX = '[MoeUB助手]';
 
     function log(...args) { console.log(LOG_PREFIX, ...args); }
 
     function getUsername() { return localStorage.getItem(STORAGE_KEY) || ''; }
     function setUsername(name) { localStorage.setItem(STORAGE_KEY, name); }
 
-    function getSiteType() {
-        if (window.location.hostname === 'cs.moeub.cn') return 'new';
-        if (window.location.hostname === 'csgo.moeub.cn') return 'old';
-        return null;
+    function isPlayPage() {
+        return window.location.hostname === 'cs.moeub.cn' && window.location.pathname.startsWith('/play');
+    }
+
+    function isUserPage() {
+        return window.location.hostname === 'cs.moeub.cn' && window.location.pathname.startsWith('/user');
     }
 
     function playSound() {
@@ -118,6 +123,63 @@
             btn.textContent = '🎯 自动进服';
             btn.style.background = '';
             btn.dataset.moActive = 'false';
+        });
+    }
+
+    function parseMapName(popup) {
+        if (!popup) return null;
+        // 先找包含 "地图名 #-ID" 的叶子节点
+        const allEls = popup.querySelectorAll('*');
+        for (const el of allEls) {
+            if (el.children.length > 0) continue;
+            const t = el.textContent.trim();
+            const m = t.match(/^(.+?)\s*#-?\d+$/);
+            if (m) return m[1].trim();
+        }
+        // 回退：匹配常见地图名格式
+        const text = popup.textContent || '';
+        const mapMatch = text.match(/(?:de_|cs_|cu_|mg_|workshop\/)[a-zA-Z0-9_/]+/i);
+        if (mapMatch) return mapMatch[0];
+        return null;
+    }
+
+    function startMapMonitoring(popup, wrapper) {
+        stopMapMonitoring();
+        mapMonitoring = true;
+        wrapper.dataset.moActive = 'true';
+        const cb = wrapper.querySelector('input[type="checkbox"]');
+        if (cb) cb.checked = true;
+
+        const mapName = parseMapName(popup);
+        lastMapName = mapName || '';
+        log('开始监控换图, 当前地图:', lastMapName || '(未识别)');
+
+        const checkMap = () => {
+            if (!popup || !document.body.contains(popup)) {
+                log('弹窗已关闭，停止换图监控');
+                stopMapMonitoring();
+                return;
+            }
+            const currentMap = parseMapName(popup);
+            if (currentMap && currentMap !== lastMapName) {
+                log(`地图变更: ${lastMapName} -> ${currentMap}`);
+                showNotification(`地图已更换: ${lastMapName} -> ${currentMap}`, 'success');
+                if (CONFIG.enableSound) playSound();
+                lastMapName = currentMap;
+            }
+        };
+
+        mapMonitorTimer = setInterval(checkMap, CONFIG.checkInterval);
+        checkMap();
+    }
+
+    function stopMapMonitoring() {
+        if (mapMonitorTimer) { clearInterval(mapMonitorTimer); mapMonitorTimer = null; }
+        mapMonitoring = false;
+        document.querySelectorAll('.mo-map-btn').forEach(wrapper => {
+            wrapper.dataset.moActive = 'false';
+            const cb = wrapper.querySelector('input[type="checkbox"]');
+            if (cb) cb.checked = false;
         });
     }
 
@@ -327,7 +389,7 @@
             if (!joinBtn) continue;
 
             const parent = joinBtn.parentElement;
-            if (parent && parent.querySelector('.mo-sniper-btn')) continue;
+            if (parent && (parent.querySelector('.mo-sniper-btn') || parent.querySelector('.mo-map-btn'))) continue;
 
             const popup = getPopupForElement(joinBtn);
             if (!popup) {
@@ -354,6 +416,19 @@
 
             const btn = createSniperButton(serverId, addr.host, addr.port, currentPlayers, maxSlots, popup);
             joinBtn.parentNode.insertBefore(btn, joinBtn);
+
+            const mapEl = findMapElement(popup);
+            const mapCheckbox = createMapMonitorCheckbox(popup);
+            if (mapEl) {
+                const wrap = document.createElement('div');
+                wrap.style.cssText = 'display:inline-flex; align-items:center; gap:4px;';
+                mapEl.parentNode.insertBefore(wrap, mapEl);
+                wrap.appendChild(mapEl);
+                wrap.appendChild(mapCheckbox);
+            } else {
+                joinBtn.parentNode.insertBefore(mapCheckbox, joinBtn);
+            }
+
             log(`已为 #${serverId} 注入自动进服按钮`);
             break;
         }
@@ -394,50 +469,51 @@
         return btn;
     }
 
-    // ============ 旧版网站 (csgo.moeub.cn) ============
-
-    function initOldSite() {
-        const observer = new MutationObserver(() => { try { injectSniperButtonOldSite(); } catch(e) {} });
-        observer.observe(document.body, { childList: true, subtree: true });
-        injectSniperButtonOldSite();
-    }
-
-    function injectSniperButtonOldSite() {
-        const rows = document.querySelectorAll('tr');
-        for (const row of rows) {
-            if (row.querySelector('.mo-sniper-btn')) continue;
-            const cells = row.querySelectorAll('td');
-            if (cells.length < 5) continue;
-            const idMatch = cells[0].textContent.match(/#(-?\d+)/);
-            if (!idMatch) continue;
-            const serverId = idMatch[1];
-            const joinBtn = row.querySelector('a[href*="connect"]');
-            if (!joinBtn) continue;
-            const href = joinBtn.getAttribute('href') || '';
-            const addrMatch = href.match(/connect\s+([^:]+):(\d+)/);
-            if (!addrMatch) continue;
-            const host = addrMatch[1], port = addrMatch[2];
-            const pm = cells[4].textContent.match(/(\d+)\s*\/\s*(\d+)/);
-            const cur = pm ? parseInt(pm[1], 10) : 0;
-            const max = pm ? parseInt(pm[2], 10) : 64;
-
-            const btn = document.createElement('button');
-            btn.className = 'mo-sniper-btn';
-            btn.textContent = '🎯 自动进服';
-            btn.dataset.moActive = 'false';
-            btn.style.cssText = `
-                display:inline-flex; align-items:center; background:linear-gradient(135deg, #667eea, #764ba2);
-                color:white; border:none; padding:6px 12px; border-radius:6px;
-                cursor:pointer; font-size:13px; margin-right:6px;
-            `;
-            btn.onclick = (e) => {
-                e.preventDefault();
-                if (monitoring && btn.dataset.moActive === 'true') { stopMonitoring(); return; }
-                startMonitoring(host, port, `${serverId} ${cur}/${max}`, btn);
-            };
-            joinBtn.parentNode.insertBefore(btn, joinBtn);
+    function findMapElement(popup) {
+        if (!popup) return null;
+        const allEls = popup.querySelectorAll('*');
+        for (const el of allEls) {
+            if (el.children.length > 0) continue;
+            const t = el.textContent.trim();
+            // 匹配 "僵尸逃跑 #-291" 或 "de_dust2 #-123" 这种地图名+ID组合
+            if (/[\u4e00-\u9fa5a-zA-Z].*#-?\d+/.test(t) && t.length < 30) return el;
         }
+        return null;
     }
+
+    function createMapMonitorCheckbox(popup) {
+        const wrapper = document.createElement('label');
+        wrapper.className = 'mo-map-btn';
+        wrapper.dataset.moActive = 'false';
+        wrapper.style.cssText = `
+            display:inline-flex; align-items:center; gap:4px;
+            cursor:pointer; font-size:13px; color:rgba(255,255,255,0.7);
+            white-space:nowrap; z-index:99999;
+            user-select:none;
+        `;
+
+        const checkbox = document.createElement('input');
+        checkbox.type = 'checkbox';
+        checkbox.style.cssText = `width:14px; height:14px; cursor:pointer; accent-color:#11998e;`;
+
+        const label = document.createElement('span');
+        label.textContent = '换图提醒';
+
+        wrapper.appendChild(checkbox);
+        wrapper.appendChild(label);
+
+        checkbox.onchange = (e) => {
+            if (checkbox.checked) {
+                startMapMonitoring(popup, wrapper);
+            } else {
+                stopMapMonitoring();
+            }
+        };
+
+        return wrapper;
+    }
+
+
 
     // ============ 用户页面自动抓取昵称 ============
 
@@ -569,22 +645,17 @@
     let currentPath = '';
 
     function runForCurrentPage() {
-        const siteType = getSiteType();
-        const path = window.location.pathname;
-        const isUserPage = path.startsWith('/user');
-        const isPlayPage = path.startsWith('/play');
-        log('页面初始化, 路径:', path, '类型:', siteType);
+        log('页面初始化, 路径:', window.location.pathname);
 
         // 清理旧的注入元素
-        document.querySelectorAll('.mo-sniper-btn, #mo-grab-user-btn').forEach(el => el.remove());
+        document.querySelectorAll('.mo-sniper-btn, .mo-map-btn, #mo-grab-user-btn').forEach(el => el.remove());
         stopMonitoring();
+        stopMapMonitoring();
 
-        if (isUserPage) {
+        if (isUserPage()) {
             initUserPage();
-        } else if (siteType === 'new' && isPlayPage) {
+        } else if (isPlayPage()) {
             initNewSite();
-        } else if (siteType === 'old') {
-            initOldSite();
         }
 
         if (!document.getElementById('mo-sniper-settings')) {
