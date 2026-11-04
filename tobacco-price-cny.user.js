@@ -2,9 +2,9 @@
 // @name         烟草商城汇率助手
 // @name:en      Tobacco Shop CNY Price Converter
 // @namespace    http://tampermonkey.net/
-// @version      1.0.0
-// @description  在春日商事、70Cigars、PIPEUNCLE 的商品价格旁显示人民币参考价；汇率来自接口盒子（阿里云社区文章），按自然日缓存，一天只请求一次
-// @description:en Show CNY reference prices on Kasuga, 70Cigars and PIPEUNCLE; exchange rate is cached per day to avoid repeated requests
+// @version      1.0.1
+// @description  在春日商事、70Cigars、PIPEUNCLE 的商品价格旁显示人民币参考价，并在烟丝详情页显示克价；汇率来自接口盒子（阿里云社区文章），按自然日缓存，一天只请求一次
+// @description:en Show CNY reference prices on Kasuga, 70Cigars and PIPEUNCLE, plus price per gram on loose tobacco detail pages; exchange rate is cached per day to avoid repeated requests
 // @author       itodouble
 // @match        https://kasugashoji.net/*
 // @match        https://www.kasugashoji.net/*
@@ -73,7 +73,8 @@
         observer: null,
         pending: new Set(),
         timer: null,
-        refreshing: false
+        refreshing: false,
+        gramWatcher: false
     };
 
     if (!state.site) return;
@@ -450,6 +451,443 @@
     }
 
     /* ------------------------------------------------------------------ *
+     * 克价（只处理商品详情页）
+     * ------------------------------------------------------------------ */
+
+    // 重量单位：公斤 / 千克 / kg / 克 / g / 盎司 / oz / 磅 / lb
+    // 不解析 mg，避免把香烟的「12mg」焦油量当成商品重量。
+    const WEIGHT_RE = /(\d+(?:[.,]\d+)?)\s*(公斤|千克|kg|公克|克|g|盎司|oz|lbs?|磅)/gi;
+
+    function cleanText(value) {
+        return String(value == null ? '' : value)
+            .replace(/\u00a0/g, ' ')
+            .replace(/\s+/g, ' ')
+            .trim();
+    }
+
+    function unitToGrams(value, unit) {
+        const u = unit.toLowerCase();
+        if (u === 'kg' || u === '公斤' || u === '千克') return value * 1000;
+        if (u === 'g' || u === '克' || u === '公克') return value;
+        if (u === 'oz' || u === '盎司') return value * 28.349523125;
+        return value * 453.59237;
+    }
+
+    /**
+     * 找出「几袋 / 几盒 / 几包」的倍数。
+     * 例如 0.05kg/box*5、5 x 50g、50g×5、5袋装 50g 都要算成总重量。
+     */
+    function findPackMultiplier(text, start, end) {
+        const before = text.slice(0, start);
+        const after = text.slice(end);
+        let match;
+
+        match = before.match(/(?:^|[^\d.,])(\d{1,3})\s*[*×xX]\s*$/);
+        if (match) return Number(match[1]);
+
+        match = before.match(/(?:^|[^\d.,])(\d{1,3})\s*(?:袋|包|盒|罐|听|条)\s*(?:装)?\s*$/);
+        if (match) return Number(match[1]);
+
+        match = after.match(/^\s*[*×xX]\s*(\d{1,3})(?![\d.,])/);
+        if (match) return Number(match[1]);
+
+        match = after.match(/^\s*(\d{1,3})\s*(?:袋|包|盒|罐|听|条)\s*(?:装)?/);
+        if (match) return Number(match[1]);
+
+        match = after.match(/[*×xX]\s*(\d{1,3})(?![\d.,])/);
+        if (match) return Number(match[1]);
+
+        match = after.match(/(?:^|[^\d.,])(\d{1,3})\s*(?:袋|包|盒|罐|听|条)\s*(?:装)?/);
+        if (match) return Number(match[1]);
+
+        return 1;
+    }
+
+    function parseWeightText(value) {
+        const text = cleanText(value);
+        if (!text) return null;
+
+        WEIGHT_RE.lastIndex = 0;
+        let match;
+        while ((match = WEIGHT_RE.exec(text))) {
+            const number = Number(String(match[1]).replace(/,/g, ''));
+            const unitGrams = unitToGrams(number, match[2]);
+            if (!(unitGrams > 0)) continue;
+
+            // 像「32.3g/1.14oz」「100g (5×20g)」这种同一规格里出现多个重量时，
+            // 第一个重量通常就是总重，不再乘后面的袋数。
+            const rest = text.slice(match.index + match[0].length);
+            const hasAnotherWeight = new RegExp(WEIGHT_RE.source, 'i').test(rest);
+            const count = hasAnotherWeight
+                ? 1
+                : findPackMultiplier(text, match.index, match.index + match[0].length);
+            const grams = unitGrams * count;
+            if (!(grams > 0)) continue;
+
+            return { grams: grams, count: count, unitGrams: unitGrams, text: text };
+        }
+        return null;
+    }
+
+    function formatGrams(grams) {
+        if (!(grams > 0)) return '';
+        if (grams >= 1000) return String(Number((grams / 1000).toFixed(2))) + 'kg';
+        return String(Number(grams.toFixed(2))) + 'g';
+    }
+
+    function formatGramPrice(value) {
+        if (!isFinite(value) || value <= 0) return '';
+        if (value >= 1) return value.toFixed(2);
+        if (value >= 0.1) return value.toFixed(3);
+        return value.toFixed(4);
+    }
+
+    function looksLikeCigar(text) {
+        return /cigars?\s*\/|\bcigars?\b|雪茄|\d+\s*支(?:\/|装|盒)/i.test(text || '');
+    }
+
+    function isProductDetailPage() {
+        if (state.site.key === 'kasuga') {
+            return document.body.classList.contains('single-product') &&
+                !!document.querySelector('.summary.entry-summary, .single-product .summary');
+        }
+        if (state.site.key === 'cigars') {
+            return document.body.classList.contains('template-product') ||
+                /\/products\/[^/?#]+/.test(location.pathname);
+        }
+        if (state.site.key === 'pipeuncle') {
+            return /\/products\/[^/?#]+/.test(location.pathname) &&
+                !!document.querySelector('.product-info-main');
+        }
+        return false;
+    }
+
+    function getPipeuncleGramInfo() {
+        const root = document.querySelector('.product-info-main');
+        if (!root) return null;
+
+        const specs = Array.from(root.querySelectorAll('.spec-btn'));
+        const active = root.querySelector('.spec-btn.active') || specs[0] || null;
+        const specText = cleanText(active && active.innerText);
+        const allSpecs = specs.map(function (btn) { return cleanText(btn.innerText); }).join(' ');
+
+        // 规格写成「12 cigars/box」的是成品雪茄，不显示克价；
+        // 烟丝规格会带 kg / g / oz 等重量单位。
+        if (looksLikeCigar(allSpecs)) return null;
+
+        // 只用规格里的净含量，例如 0.05kg/box*5 = 250g。
+        // 不用商品毛重兜底，避免给烟斗、配件等非烟丝商品算出克价。
+        const specWeight = parseWeightText(specText);
+        if (specWeight) {
+            return { grams: specWeight.grams, text: specText, source: '规格' };
+        }
+
+        return null;
+    }
+
+    function getCigarsProductType() {
+        try {
+            const meta = window.ShopifyAnalytics && window.ShopifyAnalytics.meta;
+            return meta && meta.product && meta.product.type ? String(meta.product.type) : '';
+        } catch (e) {
+            return '';
+        }
+    }
+
+    function getCigarsVariantData() {
+        const picker = document.querySelector('block-variant-picker');
+        if (!picker) return null;
+
+        const radio = picker.querySelector('input[type="radio"]:checked') ||
+            picker.querySelector('input[type="radio"]');
+        const title = radio ? cleanText(radio.value) : '';
+        if (!title) return null;
+
+        const script = picker.querySelector('script[type="application/json"]');
+        if (!script) return { title: title };
+
+        try {
+            const variants = JSON.parse(script.textContent);
+            const current = variants.find(function (item) {
+                return item.title === title || item.option1 === title;
+            });
+            if (current) {
+                return {
+                    title: title,
+                    price: Number(current.price) / 100,
+                    available: current.available !== false
+                };
+            }
+        } catch (e) { /* 忽略解析失败，退回页面价格 */ }
+
+        return { title: title };
+    }
+
+    function getCigarsGramInfo() {
+        // 70Cigars 的商品类型可以明确区分散装烟丝和成品雪茄
+        const productType = getCigarsProductType();
+        if (productType) {
+            if (/cigar|雪茄/i.test(productType)) return null;
+            if (!/tobacco|roll\s*your\s*own|\bryo\b|shag|pipe/i.test(productType)) return null;
+        }
+
+        const variant = getCigarsVariantData();
+
+        if (variant) {
+            // 售罄规格页面不会更新价格，继续算克价会用到上一个规格的价格
+            if (variant.available === false) return null;
+
+            const picker = document.querySelector('block-variant-picker');
+            const radio = picker && (picker.querySelector('input[type="radio"]:checked') ||
+                picker.querySelector('input[type="radio"]'));
+            let text = variant.title;
+
+            if (radio && radio.id && window.CSS && CSS.escape) {
+                const label = picker.querySelector('label[for="' + CSS.escape(radio.id) + '"]');
+                if (label) text = cleanText(label.innerText);
+            }
+
+            if (!productType && looksLikeCigar(text)) return null;
+            const parsed = parseWeightText(text);
+            if (parsed) {
+                return {
+                    grams: parsed.grams,
+                    text: text,
+                    source: '规格',
+                    priceAmount: isFinite(variant.price) && variant.price > 0 ? variant.price : null
+                };
+            }
+        }
+
+        // 少数商品没有规格选择器，重量写在标题里
+        const title = cleanText((document.querySelector('h1') || {}).innerText);
+        if (title && (productType || !looksLikeCigar(title))) {
+            const parsed = parseWeightText(title);
+            if (parsed) return { grams: parsed.grams, text: title, source: '标题' };
+        }
+        return null;
+    }
+
+    function getKasugaGramInfo() {
+        const summary = document.querySelector('.summary.entry-summary') || document.querySelector('.summary');
+        if (!summary) return null;
+
+        const title = cleanText((summary.querySelector('.product_title') || {}).innerText);
+        const breadcrumb = cleanText((document.querySelector('.woocommerce-breadcrumb') || {}).innerText);
+        const categoryText = breadcrumb + ' ' + title;
+
+        // 克价只针对烟丝（手卷烟丝 / 烟斗丝 / 刻烟丝）；
+        // 成品香烟、成品雪茄、卷烟纸等耗材都不显示。
+        if (!/烟丝|刻烟|手卷烟草|手卷烟丝|烟斗丝|kizami|pipe\s*tobacco|rolling\s*tobacco|shag\s*tobacco/i.test(categoryText)) {
+            return null;
+        }
+        if (/卷烟纸|滤嘴|烟具|耗材|打火机|烟灰缸|\bpaper\b|\bfilter\b/i.test(categoryText)) return null;
+
+        let text = '';
+        let source = '商品重量';
+
+        // 可变商品：优先读取当前选中的规格重量
+        const form = document.querySelector('form.variations_form');
+        if (form) {
+            const variationInput = form.querySelector('input[name="variation_id"]');
+            const variationId = variationInput && variationInput.value;
+            const raw = form.getAttribute('data-product_variations');
+            if (variationId && raw) {
+                try {
+                    const variations = JSON.parse(raw);
+                    const current = variations.find(function (item) {
+                        return String(item.variation_id) === String(variationId);
+                    });
+                    if (current && current.weight) {
+                        // WooCommerce 的重量单位在本站是公斤
+                        text = String(current.weight) + 'kg';
+                        source = '规格重量';
+                    }
+                } catch (e) { /* 忽略解析失败，继续用页面重量 */ }
+            }
+        }
+
+        if (!text) {
+            // 标题 / 简短描述里写了净含量时优先使用（例如「… 50g 斗烟丝」）
+            const shortDesc = cleanText(
+                (summary.querySelector('.woocommerce-product-details__short-description') || {}).innerText
+            );
+            const ownText = cleanText(title + ' ' + shortDesc);
+            if (parseWeightText(ownText)) {
+                text = ownText;
+                source = '商品信息';
+            }
+        }
+
+        if (!text) {
+            const weightCell = document.querySelector(
+                '.woocommerce-product-attributes-item--weight .woocommerce-product-attributes-item__value'
+            );
+            if (weightCell) {
+                text = cleanText(weightCell.innerText);
+                source = '商品重量';
+            }
+        }
+
+        const parsed = parseWeightText(text);
+        if (!parsed) return null;
+        return { grams: parsed.grams, text: text, source: source };
+    }
+
+    function getGramInfo() {
+        if (state.site.key === 'kasuga') return getKasugaGramInfo();
+        if (state.site.key === 'cigars') return getCigarsGramInfo();
+        if (state.site.key === 'pipeuncle') return getPipeuncleGramInfo();
+        return null;
+    }
+
+    function getPriceElement() {
+        if (state.site.key === 'kasuga') {
+            const summary = document.querySelector('.summary.entry-summary') || document.querySelector('.summary');
+            if (!summary) return null;
+
+            const variationPrice = summary.querySelector(
+                '.woocommerce-variation-price .woocommerce-Price-amount'
+            );
+            if (variationPrice && isVisible(variationPrice)) return variationPrice;
+
+            const amounts = Array.from(summary.querySelectorAll('.price .woocommerce-Price-amount'));
+            return amounts.find(function (el) { return !el.closest('del, s'); }) || null;
+        }
+
+        if (state.site.key === 'cigars') {
+            const block = document.querySelector('block-price');
+            if (!block) return null;
+            return block.querySelector('.block-price__sale .product__price span[aria-hidden="true"]') ||
+                block.querySelector('.block-price__regular .product__price span[aria-hidden="true"]') ||
+                block.querySelector('.product__price span[aria-hidden="true"]');
+        }
+
+        if (state.site.key === 'pipeuncle') {
+            return document.querySelector('.product-info-main .price-current');
+        }
+        return null;
+    }
+
+    function readPriceAmount(el) {
+        if (!el) return null;
+        const clone = el.cloneNode(true);
+        clone.querySelectorAll('.tm-cny-price, .tm-cny-estimate, .tm-cny-gram').forEach(function (node) {
+            node.remove();
+        });
+        return parsePrice(clone.textContent, currency);
+    }
+
+    function getGramHost() {
+        if (state.site.key === 'kasuga') {
+            const price = document.querySelector('.summary .price');
+            return price ? { el: price } : null;
+        }
+        if (state.site.key === 'cigars') {
+            const block = document.querySelector('block-price');
+            return block ? { el: block } : null;
+        }
+        if (state.site.key === 'pipeuncle') {
+            const main = document.querySelector('.product-info-main');
+            if (!main) return null;
+            const cny = main.querySelector('.price-cny');
+            if (cny) return { el: cny };
+            const section = main.querySelector('.price-section');
+            return section ? { el: section } : null;
+        }
+        return null;
+    }
+
+    function ensureGramElement() {
+        const host = getGramHost();
+        if (!host) return null;
+
+        let el = document.querySelector('.tm-cny-gram[data-tm-gram]');
+        if (!el) {
+            el = document.createElement('div');
+            el.className = 'tm-cny-gram';
+            el.setAttribute('data-tm-gram', '');
+        }
+
+        if (el.previousElementSibling !== host.el || el.parentElement !== host.el.parentElement) {
+            host.el.insertAdjacentElement('afterend', el);
+        }
+        return el;
+    }
+
+    function buildGramTitle(info, cny, perGram) {
+        const basis = info.text ? info.source + '「' + info.text + '」' : info.source;
+        return [
+            '克价 = 人民币价格 ÷ 总重量',
+            '总重：' + formatGrams(info.grams) + '（' + basis + '）',
+            '人民币价格：≈ ¥' + formatMoney(cny),
+            '克价：¥' + formatGramPrice(perGram) + ' / g',
+            '',
+            buildTitle()
+        ].join('\n');
+    }
+
+    function syncGramPrice() {
+        if (!state.entry) return;
+
+        if (!isProductDetailPage()) {
+            document.querySelectorAll('.tm-cny-gram').forEach(function (el) { el.remove(); });
+            return;
+        }
+
+        const info = getGramInfo();
+        const amount = info && info.priceAmount != null
+            ? info.priceAmount
+            : readPriceAmount(getPriceElement());
+
+        if (!info || !(info.grams > 0) || amount == null) {
+            document.querySelectorAll('.tm-cny-gram').forEach(function (el) { el.remove(); });
+            return;
+        }
+
+        const cny = amount * state.entry.rate;
+        const perGram = cny / info.grams;
+        if (!(perGram > 0)) {
+            document.querySelectorAll('.tm-cny-gram').forEach(function (el) { el.remove(); });
+            return;
+        }
+
+        const el = ensureGramElement();
+        if (!el) return;
+
+        const text = '克价 ≈ ¥' + formatGramPrice(perGram) + '/g（' + formatGrams(info.grams) + '）';
+        if (el.textContent !== text) el.textContent = text;
+
+        const title = buildGramTitle(info, cny, perGram);
+        if (el.title !== title) el.title = title;
+    }
+
+    function scheduleGramUpdate() {
+        setTimeout(syncGramPrice, 60);
+        setTimeout(syncGramPrice, 350);
+        setTimeout(syncGramPrice, 900);
+    }
+
+    function startGramWatcher() {
+        if (state.gramWatcher) return;
+        state.gramWatcher = true;
+
+        document.addEventListener('click', function (event) {
+            const target = event.target;
+            if (!target || !target.closest) return;
+            if (target.closest('.spec-btn, .variant__button-label, .product-form__input label, label[for]')) {
+                scheduleGramUpdate();
+            }
+        }, true);
+
+        document.addEventListener('change', function (event) {
+            const target = event.target;
+            if (!target || !target.matches) return;
+            if (target.matches('input[type="radio"], select')) scheduleGramUpdate();
+        }, true);
+    }
+
+    /* ------------------------------------------------------------------ *
      * 状态条
      * ------------------------------------------------------------------ */
 
@@ -524,6 +962,7 @@
         });
 
         if (state.site.key === 'pipeuncle') syncPipeuncleEstimates();
+        syncGramPrice();
         ensureBadge();
     }
 
@@ -569,8 +1008,10 @@
             });
             scan(document.body);
             if (state.site.key === 'pipeuncle') syncPipeuncleEstimates();
+            syncGramPrice();
             updateBadge();
             startObserver();
+            startGramWatcher();
         } catch (error) {
             console.warn(LOG_PREFIX, '汇率获取失败', error);
             updateBadgeError(error);
@@ -654,6 +1095,21 @@
             '  font-weight: 600;',
             '  cursor: help;',
             '}',
+            '.tm-cny-gram {',
+            '  display: inline-block;',
+            '  width: fit-content;',
+            '  align-self: flex-start;',
+            '  margin-top: 4px;',
+            '  padding: 1px 7px;',
+            '  border-radius: 4px;',
+            '  background: rgba(245, 158, 11, .16);',
+            '  color: #b45309;',
+            '  font-size: .82em;',
+            '  font-weight: 600;',
+            '  line-height: 1.5;',
+            '  white-space: nowrap;',
+            '  cursor: help;',
+            '}',
             '#tm-rate-badge {',
             '  position: fixed;',
             '  right: 12px;',
@@ -708,8 +1164,10 @@
 
         scan(document.body);
         if (state.site.key === 'pipeuncle') syncPipeuncleEstimates();
+        syncGramPrice();
         updateBadge();
         startObserver();
+        startGramWatcher();
     }
 
     init();
